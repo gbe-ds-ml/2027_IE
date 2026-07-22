@@ -67,10 +67,31 @@ html,body{width:100%;height:100%;overflow:hidden;font-family:'Noto Sans KR',sans
 /* MAP SCREEN */
 #map-screen{position:fixed;inset:0;display:none;flex-direction:column;}
 #map-screen.show{display:flex;}
-#kakao-map,#map,#popup-layer{position:absolute;inset:0;width:100%;height:100%;}
+#kakao-map,#map,#wms-layer,#popup-layer{position:absolute;inset:0;width:100%;height:100%;}
 #kakao-map{z-index:0;background:var(--bg);}
-#map{
+
+/* WMS는 현재 카카오맵 화면 범위로 한 장씩 다시 생성한다.
+   지도 이동 중에는 숨기고 이동 완료 후 새 이미지로 교체한다. */
+#wms-layer{
   z-index:1;
+  pointer-events:none;
+  overflow:hidden;
+}
+.viewport-wms-image{
+  position:absolute;
+  inset:0;
+  width:100%;
+  height:100%;
+  display:block;
+  object-fit:fill;
+  pointer-events:none;
+  user-select:none;
+  -webkit-user-drag:none;
+  transform:translateZ(0);
+}
+
+#map{
+  z-index:2;
   background:transparent !important;
   pointer-events:none;
 }
@@ -369,13 +390,16 @@ html,body{width:100%;height:100%;overflow:hidden;font-family:'Noto Sans KR',sans
 .kakao-marker-button{
   display:block;
   border:0;
-  padding:0;
-  margin:0;
+  padding:4px;
+  margin:-4px;
   background:transparent;
   cursor:pointer;
   font-family:'Noto Sans KR',sans-serif;
   touch-action:manipulation;
   -webkit-tap-highlight-color:transparent;
+  pointer-events:auto;
+  user-select:none;
+  -webkit-user-select:none;
 }
 .kakao-marker-button:focus-visible{
   outline:3px solid rgba(37,99,235,.42);
@@ -553,7 +577,7 @@ html,body{width:100%;height:100%;overflow:hidden;font-family:'Noto Sans KR',sans
 <div id="intro">
   <div class="intro-content">
     <div class="badge"><span class="badge-dot"></span>카카오맵 경로·생활안전지도 기반</div>
-    <div style="font-size:10px;color:var(--gray);margin-top:-20px;margin-bottom:28px;letter-spacing:.05em;">v.1.7.7</div>
+    <div style="font-size:10px;color:var(--gray);margin-top:-20px;margin-bottom:28px;letter-spacing:.05em;">v.1.7.8</div>
     <div class="app-name">Safe<span>Walk</span></div>
     <div class="app-sub">내 주변 안전 인프라, 미리 확인하세요</div>
     <div class="section-lbl">나는 누구인가요?</div>
@@ -612,6 +636,7 @@ html,body{width:100%;height:100%;overflow:hidden;font-family:'Noto Sans KR',sans
 
 <div id="map-screen">
   <div id="kakao-map"></div>
+  <div id="wms-layer"></div>
   <div id="map"></div>
   <div id="popup-layer"></div>
   <div id="map-spinner"><div class="mspin"></div></div>
@@ -713,19 +738,37 @@ function initSheet(){
 
   if(!routePanelResizeBound){
     routePanelResizeBound=true;
-    window.addEventListener('resize',()=>{
+    const handleViewportChange=()=>{
       if(isCompactRouteLayout()) resetRouteDetails();
+
       requestAnimationFrame(()=>{
         updateRoutePanelPosition();
         updateActivePopupPosition();
+
+        if(kakaoMap){
+          kakaoMap.relayout();
+          syncLeafletToKakao(true);
+          hideVisibleWmsDuringMotion();
+
+          setTimeout(()=>{
+            syncLeafletToKakao(true);
+            refreshVisibleWms(true);
+          },180);
+        }
       });
-    });
+    };
+
+    window.addEventListener('resize',handleViewportChange);
     window.addEventListener('orientationchange',()=>{
-      setTimeout(()=>{
-        updateRoutePanelPosition();
-        updateActivePopupPosition();
-      },250);
+      setTimeout(handleViewportChange,250);
     });
+
+    if(window.visualViewport){
+      window.visualViewport.addEventListener(
+        'resize',
+        handleViewportChange
+      );
+    }
   }
 
   requestAnimationFrame(()=>updateRoutePanelPosition());
@@ -963,11 +1006,12 @@ let locationInitToken=0;
 
 
 function stopKakaoOverlayEvent(e){
+  // touchstart에서 preventDefault 또는 stopImmediatePropagation을 호출하면
+  // iOS Safari가 이후 click을 만들지 않는 경우가 있어 사용하지 않는다.
   if(e){
-    e.preventDefault?.();
     e.stopPropagation?.();
-    e.stopImmediatePropagation?.();
   }
+
   if(window.kakao?.maps?.event?.preventMap){
     kakao.maps.event.preventMap();
   }
@@ -1112,16 +1156,86 @@ function createKakaoHtmlMarker({
   root.innerHTML=markerHtml;
 
   if(interactive){
-    ['pointerdown','touchstart','mousedown'].forEach(type=>{
-      root.addEventListener(type,stopKakaoOverlayEvent,{
-        capture:true,
-        passive:false
-      });
-    });
+    let pointerStart=null;
+    let touchStart=null;
+    let suppressClickUntil=0;
 
-    root.addEventListener('click',e=>{
+    const activate=e=>{
       stopKakaoOverlayEvent(e);
       if(popupHtml) openKakaoPopup(position,popupHtml);
+    };
+
+    // Pointer Events 지원 브라우저: 터치가 지도 드래그인지 탭인지 직접 판별한다.
+    root.addEventListener('pointerdown',e=>{
+      pointerStart={
+        id:e.pointerId,
+        x:e.clientX,
+        y:e.clientY,
+        t:Date.now()
+      };
+      stopKakaoOverlayEvent(e);
+    },{passive:true});
+
+    root.addEventListener('pointerup',e=>{
+      if(!pointerStart||pointerStart.id!==e.pointerId) return;
+
+      const moved=Math.hypot(
+        e.clientX-pointerStart.x,
+        e.clientY-pointerStart.y
+      );
+      const elapsed=Date.now()-pointerStart.t;
+      pointerStart=null;
+
+      stopKakaoOverlayEvent(e);
+
+      if(moved<=14&&elapsed<=900){
+        suppressClickUntil=Date.now()+500;
+        activate(e);
+      }
+    },{passive:true});
+
+    root.addEventListener('pointercancel',()=>{
+      pointerStart=null;
+    },{passive:true});
+
+    // 구형 iOS Safari용 touch 이벤트 보강
+    root.addEventListener('touchstart',e=>{
+      const t=e.touches[0];
+      if(!t) return;
+      touchStart={x:t.clientX,y:t.clientY,t:Date.now()};
+      stopKakaoOverlayEvent(e);
+    },{passive:true});
+
+    root.addEventListener('touchend',e=>{
+      if(!touchStart) return;
+
+      const t=e.changedTouches[0];
+      const start=touchStart;
+      touchStart=null;
+      if(!t) return;
+
+      const moved=Math.hypot(t.clientX-start.x,t.clientY-start.y);
+      const elapsed=Date.now()-start.t;
+
+      stopKakaoOverlayEvent(e);
+
+      if(moved<=14&&elapsed<=900&&Date.now()>=suppressClickUntil){
+        suppressClickUntil=Date.now()+500;
+        activate(e);
+      }
+    },{passive:true});
+
+    root.addEventListener('touchcancel',()=>{
+      touchStart=null;
+    },{passive:true});
+
+    // 데스크톱 마우스 및 접근성 클릭
+    root.addEventListener('click',e=>{
+      e.preventDefault();
+      stopKakaoOverlayEvent(e);
+
+      if(Date.now()<suppressClickUntil) return;
+      activate(e);
     });
   }
 
@@ -1197,26 +1311,35 @@ class KakaoOverlayGroup{
   }
 }
 
-function syncLeafletToKakao(){
+function kakaoLevelToLeafletZoom(level){
+  return Math.max(3,Math.min(19,20-Math.round(level)));
+}
+
+function syncLeafletToKakao(force=false){
   if(!map||!kakaoMap) return;
 
   cancelAnimationFrame(kakaoSyncFrame);
   kakaoSyncFrame=requestAnimationFrame(()=>{
     if(!map||!kakaoMap) return;
 
-    const bounds=kakaoMap.getBounds();
-    const sw=bounds.getSouthWest();
-    const ne=bounds.getNorthEast();
-    const leafletBounds=L.latLngBounds(
-      [sw.getLat(),sw.getLng()],
-      [ne.getLat(),ne.getLng()]
-    );
+    const center=kakaoMap.getCenter();
+    const targetCenter=L.latLng(center.getLat(),center.getLng());
+    const targetZoom=kakaoLevelToLeafletZoom(kakaoMap.getLevel());
 
     map.invalidateSize(false);
-    map.fitBounds(leafletBounds,{
-      animate:false,
-      padding:[0,0]
-    });
+
+    const currentCenter=map.getCenter();
+    const centerChanged=
+      Math.abs(currentCenter.lat-targetCenter.lat)>0.0000005||
+      Math.abs(currentCenter.lng-targetCenter.lng)>0.0000005;
+    const zoomChanged=Math.abs(map.getZoom()-targetZoom)>0.001;
+
+    if(force||centerChanged||zoomChanged){
+      map.setView(targetCenter,targetZoom,{
+        animate:false,
+        reset:true
+      });
+    }
 
     updateActivePopupPosition();
   });
@@ -1358,6 +1481,7 @@ function goBack(){
   mapDomCleanups=[];
 
   Object.values(layers).forEach(group=>group?.remove?.());
+  Object.values(wmsTiles).forEach(layer=>layer?.remove?.());
   closeKakaoPopup();
 
   if(map){
@@ -1371,6 +1495,9 @@ function goBack(){
 
   const popupLayer=document.getElementById('popup-layer');
   if(popupLayer) popupLayer.innerHTML='';
+
+  const wmsLayer=document.getElementById('wms-layer');
+  if(wmsLayer) wmsLayer.innerHTML='';
 
   myMark=null;
   layers={};
@@ -1419,10 +1546,20 @@ function initMap(){
 
   bindPopupCloseGuard();
 
-  const syncHandler=()=>syncLeafletToKakao();
+  const syncHandler=()=>{
+    syncLeafletToKakao();
+    hideVisibleWmsDuringMotion();
+  };
+
   kakao.maps.event.addListener(kakaoMap,'bounds_changed',syncHandler);
   mapDomCleanups.push(()=>{
-    if(kakaoMap) kakao.maps.event.removeListener(kakaoMap,'bounds_changed',syncHandler);
+    if(kakaoMap){
+      kakao.maps.event.removeListener(
+        kakaoMap,
+        'bounds_changed',
+        syncHandler
+      );
+    }
   });
 
   buildChips();
@@ -1657,13 +1794,14 @@ function setXmlLayerVisible(key,on){
 function setWmsLayerVisible(key,on){
   chipOn['w_'+key]=on;
   const layer=wmsTiles[key];
-  if(!layer||!map) return;
+  if(!layer) return;
 
   if(on){
     layer.setOpacity(0.5);
-    if(!map.hasLayer(layer)) layer.addTo(map);
+    layer.addTo();
   }else{
-    if(map.hasLayer(layer)) map.removeLayer(layer);
+    layer.remove();
+
     if(key==='cpted'){
       cptedTapRequestToken++;
       clearCptedGuide(true);
@@ -1770,13 +1908,19 @@ async function onLocated(){
   drawMe();
   revGeo();
   addWMS();
+  refreshVisibleWms(true);
   fetchAll();
 
   let moveTimer=null;
   const onKakaoIdle=()=>{
-    syncLeafletToKakao();
+    syncLeafletToKakao(true);
+    refreshVisibleWms(true);
+
     clearTimeout(moveTimer);
-    moveTimer=setTimeout(()=>fetchAll(true),MARKER_MOVE_DEBOUNCE_MS);
+    moveTimer=setTimeout(
+      ()=>fetchAll(true),
+      MARKER_MOVE_DEBOUNCE_MS
+    );
   };
   kakao.maps.event.addListener(kakaoMap,'idle',onKakaoIdle);
   mapDomCleanups.push(()=>{
@@ -1970,66 +2114,187 @@ function revGeo(){
 }
 
 /* ── WMS ── */
-const SafemapWMS4326 = L.TileLayer.extend({
-  getTileUrl: function(coords){
-    const b = this._tileCoordsToBounds(coords);
-    const bbox = [b.getWest(),b.getSouth(),b.getEast(),b.getNorth()].join(',');
-    return this._url
-      + '?serviceKey=' + API_KEY
-      + '&srs=EPSG:4326'
-      + '&bbox=' + bbox
-      + '&format=image/png&width=256&height=256&transparent=TRUE';
+class ViewportWmsOverlay{
+  constructor(key,url,{opacity=0.5,minLeafletZoom=11}={}){
+    this.key=key;
+    this.url=url;
+    this.opacity=opacity;
+    this.minLeafletZoom=minLeafletZoom;
+    this.visible=false;
+    this.element=null;
+    this.requestToken=0;
   }
-});
 
-const SafemapWMS3857 = L.TileLayer.extend({
-  getTileUrl: function(coords){
-    const b = this._tileCoordsToBounds(coords);
-    const bbox = [b.getWest(),b.getSouth(),b.getEast(),b.getNorth()].join(',');
-    return this._url
-      + '?serviceKey=' + API_KEY
-      + '&layers=A2SM_CCTV_INFO'
-      + '&styles='
-      + '&srs=EPSG:3857'
-      + '&bbox=' + bbox
-      + '&format=image/png&width=256&height=256&transparent=TRUE';
+  isVisible(){
+    return this.visible;
   }
-});
+
+  setOpacity(value){
+    this.opacity=value;
+    if(this.element) this.element.style.opacity=String(value);
+  }
+
+  addTo(){
+    this.visible=true;
+    this.refresh(true);
+    return this;
+  }
+
+  remove(){
+    this.visible=false;
+    this.requestToken++;
+
+    if(this.element){
+      this.element.remove();
+      this.element=null;
+    }
+
+    return this;
+  }
+
+  hideDuringMotion(){
+    if(this.element){
+      this.element.style.visibility='hidden';
+    }
+  }
+
+  buildUrl(){
+    if(!kakaoMap) return '';
+
+    const bounds=kakaoMap.getBounds();
+    const sw=bounds.getSouthWest();
+    const ne=bounds.getNorthEast();
+
+    const west=sw.getLng();
+    const south=sw.getLat();
+    const east=ne.getLng();
+    const north=ne.getLat();
+
+    const host=document.getElementById('wms-layer');
+    if(!host) return '';
+
+    const cssWidth=Math.max(256,Math.round(host.clientWidth||window.innerWidth));
+    const cssHeight=Math.max(256,Math.round(host.clientHeight||window.innerHeight));
+
+    // 서버 과부하 방지를 위해 긴 변을 최대 1400px로 제한하면서 비율은 유지한다.
+    const scale=Math.min(1,1400/Math.max(cssWidth,cssHeight));
+    const width=Math.max(256,Math.round(cssWidth*scale));
+    const height=Math.max(256,Math.round(cssHeight*scale));
+    const bbox=[west,south,east,north].join(',');
+
+    if(this.key==='cpted'){
+      const params=new URLSearchParams({
+        service:'WMS',
+        version:'1.1.1',
+        request:'GetMap',
+        layers:'A2SM_CPTED_G',
+        styles:'',
+        srs:'EPSG:4326',
+        bbox,
+        width:String(width),
+        height:String(height),
+        format:'image/png',
+        transparent:'TRUE'
+      });
+
+      return this.url+'?'+params.toString();
+    }
+
+    const params=new URLSearchParams({
+      serviceKey:API_KEY,
+      srs:'EPSG:4326',
+      bbox,
+      format:'image/png',
+      width:String(width),
+      height:String(height),
+      transparent:'TRUE'
+    });
+
+    return this.url+'?'+params.toString();
+  }
+
+  refresh(force=false){
+    if(!this.visible||!kakaoMap||!map) return;
+
+    const leafletZoom=kakaoLevelToLeafletZoom(kakaoMap.getLevel());
+    if(leafletZoom<this.minLeafletZoom){
+      if(this.element) this.element.style.visibility='hidden';
+      return;
+    }
+
+    const host=document.getElementById('wms-layer');
+    const src=this.buildUrl();
+    if(!host||!src) return;
+
+    const token=++this.requestToken;
+    const next=document.createElement('img');
+    next.className='viewport-wms-image';
+    next.alt='';
+    next.draggable=false;
+    next.decoding='async';
+    next.style.opacity=String(this.opacity);
+    next.style.visibility='hidden';
+
+    next.onload=()=>{
+      if(
+        token!==this.requestToken||
+        !this.visible||
+        !next.isConnected
+      ){
+        next.remove();
+        return;
+      }
+
+      if(this.element&&this.element!==next){
+        this.element.remove();
+      }
+
+      this.element=next;
+      next.style.visibility='visible';
+    };
+
+    next.onerror=()=>{
+      if(token===this.requestToken){
+        console.warn('WMS 이미지 로드 실패:',this.key);
+      }
+      next.remove();
+    };
+
+    host.appendChild(next);
+    next.src=src;
+  }
+}
+
+function hideVisibleWmsDuringMotion(){
+  Object.values(wmsTiles).forEach(layer=>{
+    if(layer?.isVisible?.()) layer.hideDuringMotion();
+  });
+}
+
+function refreshVisibleWms(force=false){
+  Object.values(wmsTiles).forEach(layer=>{
+    if(layer?.isVisible?.()) layer.refresh(force);
+  });
+}
 
 function addWMS(){
   GROUP[grp].wms.forEach(key=>{
     try{
-      const url = WMS_API[key];
+      const url=WMS_API[key];
       if(!url){
         console.warn('WMS URL 없음:',key);
         return;
       }
 
-      let t;
-      if(key==='cpted'){
-        t = L.tileLayer.wms(url,{
-          layers:'A2SM_CPTED_G',
-          format:'image/png',
-          transparent:true,
-          version:'1.3.0',
-          tiled:true,
-          opacity:0.5,
-          tileSize:256,
-          minZoom:11,
-        });
-      } else {
-        // 전국 단위에서 열지 않도록 제한해 비정상 확대 시 대량 타일과
-        // 해상에 흩어진 열지도 잔상이 표시되는 현상을 방지한다.
-        t = new SafemapWMS4326(url,{
-          opacity:0.5,
-          tileSize:256,
-          minZoom:11
-        });
-      }
+      const layer=new ViewportWmsOverlay(key,url,{
+        opacity:0.5,
+        minLeafletZoom:11
+      });
 
-      wmsTiles[key]=t;
+      wmsTiles[key]=layer;
+
       if(chipOn['w_'+key]){
-        t.addTo(map);
+        layer.addTo();
       }
     }catch(e){
       console.warn('WMS 오류',key,e);
